@@ -176,6 +176,8 @@ def _write_holder_sheet(writer: pd.ExcelWriter, holder_history_df: pd.DataFrame)
 
 def _write_params_sheet(writer: pd.ExcelWriter, params: Dict[str, Any]) -> None:
     """寫入本次篩選參數設定紀錄（Sheet 4）"""
+    data_source = params.get('data_source', 'csv')
+    data_source_label = 'FinMind sponsor API 自動下載' if data_source == 'finmind' else '手動 CSV 上傳'
     sheet_name = '參數設定紀錄'
 
     market_label = {'all': '全部', 'listed': '上市（TWSE）', 'otc': '上櫃（OTC）'}
@@ -184,6 +186,7 @@ def _write_params_sheet(writer: pd.ExcelWriter, params: Dict[str, Any]) -> None:
     params_data = {
         '參數名稱': [
             '篩選執行時間',
+            '資料來源模式',
             '最小連續買超天數',
             '現價高於主力成本上限 (%)',
             '集保戶數觀察週數',
@@ -194,6 +197,7 @@ def _write_params_sheet(writer: pd.ExcelWriter, params: Dict[str, Any]) -> None:
         ],
         '設定值': [
             datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            data_source_label,
             params.get('min_consecutive_days', 3),
             params.get('max_price_deviation_pct', 5.0),
             params.get('holder_observation_weeks', 4),
@@ -204,6 +208,7 @@ def _write_params_sheet(writer: pd.ExcelWriter, params: Dict[str, Any]) -> None:
         ],
         '說明': [
             '自動記錄，供回測比對',
+            '本次執行使用手動 CSV 或 FinMind sponsor API',
             '同一分點連續正買超至少幾天',
             '現價超過此比例則淘汰',
             '最新集保戶數 vs. N週前的比較週距',
@@ -213,6 +218,29 @@ def _write_params_sheet(writer: pd.ExcelWriter, params: Dict[str, Any]) -> None:
             '上市=TWSE；上櫃=OTC；全部=兩者皆納入',
         ]
     }
+
+    if data_source == 'finmind':
+        params_data['參數名稱'].extend([
+            '原始輸入股票清單',
+            '自動下載股票清單',
+            '自動下載開始日期',
+            '自動下載結束日期',
+            '集保補抓起始日期',
+        ])
+        params_data['設定值'].extend([
+            ', '.join(params.get('requested_stock_ids', params.get('broker_stock_ids', []))),
+            ', '.join(params.get('broker_stock_ids', [])),
+            params.get('broker_start_date', ''),
+            params.get('broker_end_date', ''),
+            params.get('holder_start_date', ''),
+        ])
+        params_data['說明'].extend([
+            '使用者在自動下載模式輸入的原始股票代號清單',
+            '本次向 FinMind 查詢的股票代號',
+            '股價與券商分點資料的下載起點',
+            '股價、集保、券商分點資料的下載終點',
+            '為滿足觀察週數而自動往前延伸的集保資料起點',
+        ])
 
     pd.DataFrame(params_data).to_excel(writer, sheet_name=sheet_name, index=False)
     ws = writer.sheets[sheet_name]

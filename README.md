@@ -41,6 +41,40 @@ streamlit run app.py
 
 ---
 
+## FinMind 自動下載模式
+
+目前系統已支援改用 FinMind sponsor API 自動下載三份資料：
+
+- 切換方式：側邊欄「資料來源模式」改選 `FinMind sponsor API 自動下載`
+- 自動下載範圍：只下載你輸入的股票代號清單
+- 股票市場範圍：若選擇 `上市（TWSE）` 或 `上櫃（OTC）`，系統會在下載前先依 FinMind 的股票資訊過濾輸入清單
+- 自動下載資料：券商分點、股價、集保戶數
+- 股價來源：`TaiwanStockPrice`，系統會自動把成交量從股數換算成張
+- 集保來源：`TaiwanStockHoldingSharesPer`，系統會自動依週別彙總 `people` 成 `holder_count`
+- 集保抓取範圍：會依你設定的觀察週數，自動往前多抓幾週，避免資料不足
+- 本地快取：查詢結果會寫入 `.cache/finmind/`，同條件下次可直接重用
+
+### Token 設定方式
+
+可擇一使用：
+
+1. 在側邊欄直接貼上 FinMind sponsor token
+2. 先設定環境變數 `FINMIND_API_TOKEN`
+
+```bash
+export FINMIND_API_TOKEN="你的_finmind_token"
+streamlit run app.py
+```
+
+### 使用限制
+
+- FinMind 分點資料最早僅支援 `2021-06-30`
+- FinMind 集保戶數資料最早僅支援 `2010-01-29`
+- 已知缺漏日期：`2022-10-31 ~ 2022-11-03`、`2023-01-11 ~ 2023-01-17`
+- 若 sponsor 權限不足、token 無效、或超過 API 用量上限，系統會直接顯示錯誤訊息
+
+---
+
 ## CSV 檔案格式
 
 ### ① broker_trading.csv（券商分點買賣超）
@@ -151,6 +185,16 @@ DEFAULT_CONFIG = {
 }
 ```
 
+FinMind 相關設定則集中在 `config.py` 的 `FINMIND_CONFIG`：
+
+```python
+FINMIND_CONFIG = {
+    "broker_min_date": "2021-06-30",
+    "timeout_seconds": 30,
+    "cache_dir": ".cache/finmind",
+}
+```
+
 ---
 
 ## 如何匯出 Excel
@@ -170,7 +214,7 @@ DEFAULT_CONFIG = {
 stock_chip_selector/
 ├── app.py                  # Streamlit 主程式（UI 與主流程）
 ├── config.py               # 預設參數與常數
-├── data_loader.py          # CSV 資料載入、欄位清理、API TODO
+├── data_loader.py          # CSV / FinMind 資料載入與欄位清理
 ├── broker_analyzer.py      # 連續買超 streak 分析
 ├── cost_calculator.py      # 主力平均成本、偏離率計算
 ├── holder_analyzer.py      # 集保戶數變化分析
@@ -188,12 +232,12 @@ stock_chip_selector/
 
 ---
 
-## 未來擴充（API 模式）
+## 資料來源現況
 
-`data_loader.py` 中已預留以下 TODO 介面：
+- 手動模式：上傳 `broker_trading.csv`、`price_data.csv`、`holder_data.csv`
+- 自動模式：以 FinMind sponsor API 自動下載券商分點、股價、集保戶數，並可依 `market_scope` 先過濾上市 / 上櫃股票
 
-- `fetch_broker_trading_from_api()` - 可串接富果 API、永豐金 API
-- `fetch_price_from_twse()` - 可串接台灣證券交易所
-- `fetch_holder_from_tdcc()` - 可串接台灣集保公司
+後續若要再擴充，可補上：
 
-待補充真實 API 後，取消 TODO 註解即可切換至線上資料來源。
+- `fetch_price_from_twse()` - 串接台灣證券交易所
+- `fetch_holder_from_tdcc()` - 串接台灣集保公司

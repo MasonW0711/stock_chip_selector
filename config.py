@@ -20,6 +20,16 @@ DEFAULT_CONFIG = {
     "market_scope": "all",
 }
 
+# ── FinMind API 設定 ──
+FINMIND_CONFIG = {
+    # 分點資料可查詢的最早日期
+    "broker_min_date": "2021-06-30",
+    # API request timeout（秒）
+    "timeout_seconds": 30,
+    # 本地快取路徑
+    "cache_dir": ".cache/finmind",
+}
+
 # ── 資料欄位名稱定義（統一規範） ──
 
 # 券商分點買賣超資料欄位

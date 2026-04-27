@@ -6,7 +6,7 @@
 import os
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from broker_analyzer import find_consecutive_buying_streaks
 from charts import create_broker_volume_chart, create_holder_chart, create_price_chart
-from config import DEFAULT_CONFIG
+from config import DEFAULT_CONFIG, FINMIND_CONFIG
 from cost_calculator import (
     build_latest_close_lookup,
     calculate_average_cost,
@@ -26,6 +26,10 @@ from cost_calculator import (
     get_price_deviation_label,
 )
 from data_loader import (
+    fetch_broker_trading_from_finmind,
+    fetch_holder_data_from_finmind,
+    fetch_price_data_from_finmind,
+    filter_stock_ids_by_market_scope,
     filter_by_volume,
     load_broker_trading,
     load_holder_data,
@@ -35,6 +39,61 @@ from data_loader import (
 from holder_analyzer import analyze_holder_change, build_holder_lookup, get_holder_history
 from report_exporter import export_to_excel
 from scoring import calculate_score, get_score_label
+
+
+def parse_stock_ids_input(raw_text: str) -> list[str]:
+    """將使用者輸入的股票代號字串轉成去重後列表。"""
+    stock_ids: list[str] = []
+    seen: set[str] = set()
+
+    for item in raw_text.replace('\n', ',').split(','):
+        stock_id = item.strip()
+        if not stock_id or stock_id in seen:
+            continue
+        seen.add(stock_id)
+        stock_ids.append(stock_id)
+
+    return stock_ids
+
+
+def build_stock_name_lookup(price_df: pd.DataFrame) -> dict[str, str]:
+    """從股價資料建立股票名稱對照表。"""
+    if 'stock_name' not in price_df.columns:
+        return {}
+
+    lookup_df = price_df[['stock_id', 'stock_name']].copy()
+    lookup_df['stock_name'] = lookup_df['stock_name'].fillna('').astype(str).str.strip()
+    lookup_df = lookup_df[lookup_df['stock_name'] != '']
+    lookup_df = lookup_df.drop_duplicates(subset=['stock_id'], keep='last')
+
+    return lookup_df.set_index('stock_id')['stock_name'].to_dict()
+
+
+def fill_broker_stock_names(
+    broker_df: pd.DataFrame,
+    stock_name_lookup: dict[str, str],
+) -> pd.DataFrame:
+    """補齊券商分點資料中缺漏的股票名稱。"""
+    if not stock_name_lookup or 'stock_name' not in broker_df.columns:
+        return broker_df
+
+    enriched_df = broker_df.copy()
+    missing_mask = enriched_df['stock_name'].fillna('').astype(str).str.strip() == ''
+    enriched_df.loc[missing_mask, 'stock_name'] = (
+        enriched_df.loc[missing_mask, 'stock_id'].map(stock_name_lookup).fillna('')
+    )
+    return enriched_df
+
+
+def calculate_holder_fetch_start_date(
+    selected_start_date,
+    selected_end_date,
+    observation_weeks: int,
+):
+    """自動延長集保抓取起點，避免週資料不足。"""
+    buffer_days = (int(observation_weeks) + 8) * 7
+    buffered_start_date = selected_end_date - timedelta(days=buffer_days)
+    return min(selected_start_date, buffered_start_date)
 
 # ── 頁面設定 ──────────────────────────────────────────────────────────
 st.set_page_config(
@@ -68,35 +127,93 @@ for key in ['results_df', 'broker_detail_df', 'holder_history_df',
     if key not in st.session_state:
         st.session_state[key] = None
 
+env_finmind_token = os.getenv('FINMIND_API_TOKEN', '').strip()
+finmind_min_date = datetime.strptime(FINMIND_CONFIG['broker_min_date'], '%Y-%m-%d').date()
+today = datetime.today().date()
+default_finmind_start = max(finmind_min_date, today - timedelta(days=30))
+broker_file = None
+price_file = None
+holder_file = None
+finmind_token_input = ''
+finmind_stock_ids_text = ''
+finmind_start_date = default_finmind_start
+finmind_end_date = today
+finmind_force_refresh = False
+
 # ═══════════════════════════════════════════════════════════════════
 # 側邊欄：資料上傳 + 篩選參數
 # ═══════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.header('📂 上傳資料檔案')
 
-    broker_file = st.file_uploader(
-        '① 券商分點買賣超（broker_trading.csv）',
-        type=['csv'],
-        help='欄位：date, stock_id, stock_name, broker, branch, buy_volume, sell_volume, net_buy, buy_avg_price'
+    data_source = st.radio(
+        '資料來源模式',
+        options=['csv', 'finmind'],
+        format_func=lambda value: {
+            'csv': '📄 手動上傳三個 CSV',
+            'finmind': '🔄 FinMind sponsor API 自動下載',
+        }[value],
+        help='CSV 模式需自行上傳三份資料；FinMind 模式會自動下載券商分點、股價、集保戶數。',
     )
 
-    price_file = st.file_uploader(
-        '② 股價資料（price_data.csv）',
-        type=['csv'],
-        help='欄位：date, stock_id, stock_name, open, high, low, close, volume'
-    )
+    if data_source == 'csv':
+        broker_file = st.file_uploader(
+            '① 券商分點買賣超（broker_trading.csv）',
+            type=['csv'],
+            help='欄位：date, stock_id, stock_name, broker, branch, buy_volume, sell_volume, net_buy, buy_avg_price'
+        )
+        price_file = st.file_uploader(
+            '② 股價資料（price_data.csv）',
+            type=['csv'],
+            help='欄位：date, stock_id, stock_name, open, high, low, close, volume'
+        )
 
-    holder_file = st.file_uploader(
-        '③ 集保戶數（holder_data.csv）',
-        type=['csv'],
-        help='欄位：week_date, stock_id, stock_name, holder_count'
-    )
+        holder_file = st.file_uploader(
+            '③ 集保戶數（holder_data.csv）',
+            type=['csv'],
+            help='欄位：week_date, stock_id, stock_name, holder_count'
+        )
+    else:
+        finmind_token_input = st.text_input(
+            '① FinMind Sponsor Token',
+            type='password',
+            help='可直接貼上 token；若留空則改用環境變數 FINMIND_API_TOKEN。股價、集保、分點都會共用這組 token。',
+        )
+        if env_finmind_token:
+            st.caption('已偵測到環境變數 FINMIND_API_TOKEN，欄位留空時會自動使用。')
+
+        finmind_stock_ids_text = st.text_area(
+            '② 股票代號清單',
+            value='',
+            height=90,
+            placeholder='2330, 2317, 2454',
+            help='以逗號或換行分隔，系統會用這份清單自動抓取股價、集保與券商分點資料。',
+        )
+        finmind_start_date = st.date_input(
+            '③ 自動下載開始日期',
+            value=default_finmind_start,
+            min_value=finmind_min_date,
+            max_value=today,
+            help=f'券商分點資料最早僅支援 {FINMIND_CONFIG["broker_min_date"]}；集保資料會自動往前多抓幾週以符合觀察需求。',
+        )
+        finmind_end_date = st.date_input(
+            '④ 自動下載結束日期',
+            value=today,
+            min_value=finmind_min_date,
+            max_value=today,
+        )
+        finmind_force_refresh = st.checkbox(
+            '忽略快取並重新抓取',
+            value=False,
+            help='勾選後會直接向 FinMind 重新下載資料。',
+        )
 
     # 顯示上傳狀態
+    finmind_ready = bool(parse_stock_ids_input(finmind_stock_ids_text)) and bool(finmind_token_input.strip() or env_finmind_token)
     upload_status = {
-        '券商分點': '✅' if broker_file else '⬜',
-        '股價資料': '✅' if price_file else '⬜',
-        '集保戶數': '✅' if holder_file else '⬜',
+        '券商分點': '✅' if (broker_file if data_source == 'csv' else finmind_ready) else '⬜',
+        '股價資料': '✅' if (price_file if data_source == 'csv' else finmind_ready) else '⬜',
+        '集保戶數': '✅' if (holder_file if data_source == 'csv' else finmind_ready) else '⬜',
     }
     for name, status in upload_status.items():
         st.write(f'{status} {name}')
@@ -150,7 +267,7 @@ with st.sidebar:
         options=['all', 'listed', 'otc'],
         format_func=lambda x: {'all': '🌐 全部', 'listed': '🔵 上市（TWSE）', 'otc': '🟢 上櫃（OTC）'}[x],
         index=0,
-        help='目前版本（CSV 模式）此設定僅供紀錄，實際過濾依上傳的資料決定'
+        help='FinMind 自動下載模式會先依此範圍過濾股票清單；CSV 模式目前仍僅供紀錄。'
     )
 
     st.divider()
@@ -165,28 +282,122 @@ params = {
     'strict_trend_mode': strict_trend_mode,
     'min_volume': min_volume,
     'market_scope': market_scope,
+    'data_source': data_source,
+    'broker_source': data_source,
+    'price_source': data_source,
+    'holder_source': data_source,
+    'broker_stock_ids': parse_stock_ids_input(finmind_stock_ids_text) if data_source == 'finmind' else [],
+    'broker_start_date': str(finmind_start_date) if data_source == 'finmind' else None,
+    'broker_end_date': str(finmind_end_date) if data_source == 'finmind' else None,
 }
 
 # ═══════════════════════════════════════════════════════════════════
 # 執行篩選邏輯
 # ═══════════════════════════════════════════════════════════════════
 if run_button:
-    if not (broker_file and price_file and holder_file):
-        st.error('⚠️ 請先上傳三個 CSV 檔案（券商分點、股價、集保戶數）再執行篩選！')
-        st.stop()
+    finmind_token = finmind_token_input.strip() or env_finmind_token
+    finmind_stock_ids = parse_stock_ids_input(finmind_stock_ids_text)
+    requested_finmind_stock_ids = finmind_stock_ids.copy()
+
+    if data_source == 'csv':
+        if not (broker_file and price_file and holder_file):
+            st.error('⚠️ 目前使用手動模式，請先上傳三個 CSV 檔案再執行篩選。')
+            st.stop()
+
+    if data_source == 'finmind':
+        if not finmind_token:
+            st.error('⚠️ 請輸入 FinMind Sponsor Token，或先設定環境變數 FINMIND_API_TOKEN。')
+            st.stop()
+        if not finmind_stock_ids:
+            st.error('⚠️ 請至少輸入一檔股票代號，才能自動下載股價、集保與券商分點資料。')
+            st.stop()
+        if finmind_end_date < finmind_start_date:
+            st.error('⚠️ 自動下載的結束日期不可早於開始日期。')
+            st.stop()
 
     progress_bar = st.progress(0, text='載入資料中...')
 
     try:
         # ── 步驟 1：載入三份資料 ──────────────────────────────────────
-        progress_bar.progress(10, text='載入券商分點資料...')
-        broker_df = load_broker_trading(broker_file)
+        if data_source == 'csv':
+            progress_bar.progress(10, text='載入股價資料...')
+            price_df = load_price_data(price_file)
 
-        progress_bar.progress(25, text='載入股價資料...')
-        price_df = load_price_data(price_file)
+            progress_bar.progress(25, text='載入集保戶數資料...')
+            holder_df = load_holder_data(holder_file)
 
-        progress_bar.progress(40, text='載入集保戶數資料...')
-        holder_df = load_holder_data(holder_file)
+            stock_name_lookup = build_stock_name_lookup(price_df)
+
+            progress_bar.progress(40, text='載入券商分點資料...')
+            broker_df = load_broker_trading(broker_file)
+        else:
+            progress_bar.progress(10, text='下載股票資訊並套用市場範圍...')
+            finmind_stock_ids, stock_name_lookup, market_scope_warnings = filter_stock_ids_by_market_scope(
+                finmind_stock_ids,
+                market_scope=market_scope,
+                api_token=finmind_token,
+                timeout_seconds=int(FINMIND_CONFIG['timeout_seconds']),
+            )
+
+            params['requested_stock_ids'] = requested_finmind_stock_ids
+            params['broker_stock_ids'] = finmind_stock_ids
+
+            for warning in market_scope_warnings:
+                st.warning(warning)
+
+            if not finmind_stock_ids:
+                raise ValueError(
+                    '套用目前的股票市場範圍後，沒有剩餘可下載的股票代號；'
+                    '請調整市場範圍或股票清單。'
+                )
+
+            progress_bar.progress(20, text='下載股價資料...')
+            price_df = fetch_price_data_from_finmind(
+                stock_ids=finmind_stock_ids,
+                start_date=str(finmind_start_date),
+                end_date=str(finmind_end_date),
+                api_token=finmind_token,
+                stock_name_lookup=stock_name_lookup,
+                cache_dir=FINMIND_CONFIG['cache_dir'],
+                force_refresh=finmind_force_refresh,
+                timeout_seconds=int(FINMIND_CONFIG['timeout_seconds']),
+            )
+
+            holder_fetch_start_date = calculate_holder_fetch_start_date(
+                finmind_start_date,
+                finmind_end_date,
+                holder_observation_weeks,
+            )
+            params['holder_start_date'] = str(holder_fetch_start_date)
+
+            progress_bar.progress(35, text='下載集保戶數資料...')
+            holder_df = fetch_holder_data_from_finmind(
+                stock_ids=finmind_stock_ids,
+                start_date=str(holder_fetch_start_date),
+                end_date=str(finmind_end_date),
+                api_token=finmind_token,
+                stock_name_lookup=stock_name_lookup,
+                cache_dir=FINMIND_CONFIG['cache_dir'],
+                force_refresh=finmind_force_refresh,
+                timeout_seconds=int(FINMIND_CONFIG['timeout_seconds']),
+            )
+
+            progress_bar.progress(50, text='下載券商分點資料...')
+            broker_df, broker_warnings = fetch_broker_trading_from_finmind(
+                stock_ids=finmind_stock_ids,
+                start_date=str(finmind_start_date),
+                end_date=str(finmind_end_date),
+                api_token=finmind_token,
+                stock_name_lookup=stock_name_lookup,
+                cache_dir=FINMIND_CONFIG['cache_dir'],
+                force_refresh=finmind_force_refresh,
+                timeout_seconds=int(FINMIND_CONFIG['timeout_seconds']),
+            )
+
+            for warning in broker_warnings:
+                st.warning(warning)
+
+        broker_df = fill_broker_stock_names(broker_df, stock_name_lookup)
 
         # 儲存原始資料到 Session State（圖表使用）
         st.session_state['broker_df'] = broker_df
@@ -523,14 +734,14 @@ else:
     st.info('''
 ### 🚀 使用步驟
 
-1. 在左側側邊欄**上傳三個 CSV 資料檔案**
-2. 依需求**調整篩選參數**（可使用預設值快速上手）
-3. 點擊「**開始篩選**」執行三關選股
-4. 查看結果表格，點選個股查看圖表
-5. 點擊「**下載 Excel 報表**」匯出完整報告
+1. 在左側選擇 **資料來源模式**：手動 CSV 或 FinMind 自動下載
+2. 若使用 CSV 模式，請上傳三個資料檔；若使用 FinMind 模式，請填入 token、股票清單與日期區間
+3. 依需求**調整篩選參數**（可使用預設值快速上手）
+4. 點擊「**開始篩選**」執行三關選股
+5. 查看結果表格，點選個股查看圖表，並可匯出 Excel 報表
 ''')
 
-    st.subheader('📄 CSV 檔案格式說明')
+    st.subheader('📄 CSV 模式欄位格式說明')
 
     col1, col2, col3 = st.columns(3)
 
